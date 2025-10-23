@@ -1,0 +1,202 @@
+AI Image Text Editor – Technical Guide
+
+Overview
+This document explains what each part of the project does, why particular technologies were chosen, and how the pieces work together end-to-end. The app allows users to upload an AI-generated image. The backend runs OCR-based analysis to detect text elements and infer properties like font size and color. The frontend renders the image and the detected elements on a canvas-like editor (Konva), where users can edit text content, font, color, size, move/resize elements, save changes, and export the final image.
+
+Top-Level Structure
+- /backend: Django REST API. Handles uploads, analysis (OCR + heuristics), persistence, Cloudinary integration.
+- /frontend: React + Vite + Tailwind + Konva editor. Handles upload, visualization, editing, exporting.
+
+Why These Technologies
+- Django REST Framework: Mature, robust API layer with excellent serialization, routing, and integration with Django ORM. Quick to build, secure, and well-known.
+- Tesseract (pytesseract): Open-source OCR engine, widely used and reliable for extracting text and bounding boxes from images.
+- Heuristic font detection: Fully accurate font recognition is non-trivial and can require heavy ML models. We start with a lightweight heuristic classifying serif vs sans-serif and mapping to common fonts (Times New Roman vs Arial). Users can adjust in the editor.
+- Color extraction via adaptive threshold + averaging: Simple, fast, and surprisingly effective for isolating text pixels and inferring stroke color.
+- Cloudinary: Optional remote storage to host images with a CDN and transformations. If not configured, files are stored locally under backend/media/.
+- React + Konva: Provides a canvas-like editing experience similar to Figma/Canva. Konva offers performant layer-based manipulation of text and shapes.
+- Tailwind CSS: Speeds up UI implementation with utility classes and consistent styling.
+- PostgreSQL: Production-grade RDBMS. For local and quick starts, DATABASE_URL can be omitted and SQLite is used automatically.
+
+Backend Details
+Django Settings (backend/server/settings.py)
+- DEBUG, SECRET_KEY, ALLOWED_HOSTS: Standard Django settings. DEBUG should be 0 in production.
+- DATABASES: Uses dj-database-url to parse DATABASE_URL. Falls back to an on-disk SQLite for local runs.
+- INSTALLED_APPS: Includes rest_framework, corsheaders, and the local app api.
+- MEDIA and STATIC: Local storage defaults to backend/media and backend/staticfiles.
+- CORS: Enabled for convenience in development to allow the frontend dev server to reach the backend API.
+- CLOUDINARY_URL: If provided, enables Cloudinary uploads (see api/cloud.py).
+
+Models (backend/api/models.py)
+- ImageAsset:
+  - original_image_url: Cloudinary URL if configured; otherwise blank.
+  - local_image: Local file path to the uploaded image (stored under media/uploads/).
+  - width, height: Dimensions of the image in pixels.
+  - elements: JSON field storing the list of detected/editable elements. For now, elements are text nodes only.
+  - created_at, updated_at: Timestamps.
+
+Endpoints (backend/api/urls.py, backend/api/views.py)
+- POST /api/upload/
+  - Accepts multipart form-data with key image.
+  - Saves the image (locally first, optionally to Cloudinary).
+  - Runs analyze_image to extract elements (OCR + color + font size + heuristic font family).
+  - Persists ImageAsset including elements and returns:
+    {
+      id, original_image_url, width, height, elements, image_url
+    }
+  - image_url is the chosen source URL for the frontend (Cloudinary if available, else local).
+- GET /api/images/<id>/
+  - Returns the ImageAsset and its elements + image_url.
+- PUT /api/images/<id>/
+  - Accepts { elements: [...] } to update persisted layer data.
+
+Serializers (backend/api/serializers.py)
+- ElementSerializer: Validates the schema of each element (text type with position, size, fontFamily, fontSize, fill).
+- ImageAssetSerializer: Serializes ImageAsset for API responses.
+
+Core Analysis Pipeline (backend/api/processing.py)
+- pil_image_from_fileobj: Opens uploaded file as PIL Image, ensuring RGB/RGBA modes.
+- pytesseract.image_to_data: Uses Tesseract to detect text words/blocks, returning TSV/DF with bounding boxes and confidence scores.
+- Filtering: Drops empty/low-confidence detections (conf < 50).
+- Font size estimation (_estimate_font_size_from_bbox):
+  - Approximates font size using bounding box height divided by ~1.2. Simple but effective as a starting point.
+- Text color estimation (_average_text_color_from_bbox):
+  - Crops the text region and creates a grayscale image.
+  - Uses adaptive threshold to separate foreground text from background.
+  - Averages colors of foreground pixels to estimate the text color (hex string).
+  - Falls back to region mean if insufficient foreground pixels are detected.
+- Heuristic font detection (_classify_serif_sans + _map_font_family):
+  - Produces an edge map via Canny.
+  - HoughLinesP to count short line segments; serifs often introduce extra small strokes.
+  - If short segment ratio is high, classify as serif; else sans-serif.
+  - Maps to Times New Roman (serif) or Arial (sans-serif).
+- Returns list of elements with:
+  - id (uuid), type=text, text content, x/y/width/height, fontFamily, fontSize, fill(color).
+
+Cloudinary Integration (backend/api/cloud.py)
+- Optional. If CLOUDINARY_URL is set, uploaded images are sent to Cloudinary.
+- The ImageAsset keeps both local file and original_image_url; the frontend uses image_source_url() for the preferred URL.
+
+Migrations
+- backend/api/migrations/0001_initial.py creates the ImageAsset table and fields.
+
+Frontend Details
+Build and Dev Setup
+- Vite for fast dev server and build.
+- Tailwind configured in tailwind.config.js and postcss.config.js.
+- Dev proxy in vite.config.js sends /api requests to http://localhost:8000.
+
+Entry and App Layout
+- index.html mounts React to #root.
+- src/main.jsx bootstraps React StrictMode and loads global Tailwind styles.
+- src/App.jsx:
+  - UI includes a left sidebar to upload, display status, and show basic info; main area renders the Editor; right sidebar has save/download controls and an Inspector when a layer is selected.
+  - Uploads the selected file directly to POST /api/upload/. On success, stores the returned ImageAsset with image_url and elements.
+  - Save button sends updated elements via PUT /api/images/:id/.
+
+Canvas Editor (src/components/Editor.jsx)
+- Uses react-konva / Konva primitives:
+  - Stage and Layer form the canvas space.
+  - KonvaImage displays the base image loaded via use-image (use-image dependency).
+  - Each detected text element is rendered as a KonvaText node with:
+    - text, fontFamily, fontSize, fill, x, y, width, height.
+  - Dragging and Transformer-based resizing are enabled:
+    - Dragging updates x/y.
+    - The transformer handles width/height scaling; fontSize adjusts proportionally on vertical scaling.
+  - Selection:
+    - Clicking a text node selects it and shows a Transformer (resize handles).
+    - Clicking on empty canvas deselects.
+- Coordinates and Scaling:
+  - The Stage is resized to fit the window while maintaining aspect ratio.
+  - A scale factor is computed from stage size vs original image size.
+  - When the user manipulates a shape on the scaled stage, the app normalizes the changed values back to original image coordinates (so saves are resolution-accurate).
+- Inspector Panel:
+  - When an element is selected, the right sidebar shows inputs to edit:
+    - text, fontFamily (dropdown: Arial/Times/Helvetica/Georgia/Courier/Inter), fontSize, color, x/y/width/height.
+  - Edits update the element list in local state.
+- Export:
+  - “Download PNG” uses Stage.toDataURL() to download a rendered PNG.
+- Save:
+  - Calls onSave(elements) from App which PUTs to the backend to persist edits.
+
+Data Model for Elements
+Each element has:
+{
+  id: string,          // uuid
+  type: "text",
+  text: string,
+  x: number, y: number,
+  width: number, height: number,
+  fontFamily: string,
+  fontSize: number,
+  fill: string,        // hex color, e.g. #112233
+}
+These are kept in original image coordinates and sizes. The editor applies the current scale factor for display, and converts edits back to original dimensions on save.
+
+Environment and Configuration
+Backend (.env in /backend):
+- DJANGO_SECRET_KEY: Secret key; set to a secure value in production.
+- DEBUG: "1" for development; "0" for production.
+- ALLOWED_HOSTS: Comma-separated hostnames.
+- DATABASE_URL (optional): PostgreSQL connection string. If absent, SQLite is used.
+- CLOUDINARY_URL (optional): Enables Cloudinary upload for images. If absent, local file storage is used.
+
+Frontend:
+- vite.config.js proxies /api to http://localhost:8000 for local dev.
+
+Running Locally
+Backend:
+1) cd backend
+2) python -m venv .venv && source .venv/bin/activate
+3) pip install -r requirements.txt
+4) Create .env (see Environment and Configuration)
+5) python manage.py migrate
+6) python manage.py runserver
+
+Frontend:
+1) cd frontend
+2) npm install
+3) npm run dev
+4) Open http://localhost:5173
+
+API Quick Reference
+- POST /api/upload/
+  - multipart/form-data: image=<file>
+  - Response 201:
+    { id, original_image_url, width, height, elements, image_url }
+- GET /api/images/<id>/
+  - Response 200:
+    { id, original_image_url, width, height, elements, image_url }
+- PUT /api/images/<id>/
+  - JSON body: { elements: [...] }
+  - Response 200: same schema as GET with updated elements.
+
+Limitations and Accuracy Notes
+- OCR: Tesseract results depend on image quality, font clarity, contrast, and alignment. Low-contrast or stylized fonts may reduce detection quality. Confidence < 50 filtered by default to reduce false positives.
+- Font detection: Full font family recognition is beyond the scope of simple heuristics. We approximate serif vs sans-serif and offer users the ability to change font family in the editor.
+- Color extraction: Works well for solid text on contrasting backgrounds. Transparent overlays, gradients, or heavy compression may reduce accuracy.
+
+Security and Production Notes
+- Set DEBUG=0 and proper ALLOWED_HOSTS in production.
+- Use HTTPS and secure cookie settings if serving the backend with authentication in the future.
+- Consider rate limiting and validation for uploads (file type, size limits).
+- Store large original images in a reliable object store (Cloudinary/S3).
+- Run Django behind gunicorn/uvicorn and a reverse proxy (nginx).
+- Use PostgreSQL for production storage with automated backups.
+
+Possible Enhancements
+- True font identification with a model/API that compares glyphs to a known font library.
+- Better OCR post-processing (spell-check, line grouping, multi-language support).
+- Text styling additions in the editor (bold/italic, letter spacing, line height).
+- Non-text element detection (shapes, icons) using CV/ML.
+- Project/workspace save and multi-page templates.
+- User accounts and sharing links, versioning, and collaboration.
+- Docker and docker-compose for one-command local setup (frontend + backend + PostgreSQL).
+
+Testing Tips
+- Verify Tesseract installation: `tesseract --version`
+- Test upload with a PNG or JPEG containing clear text.
+- Confirm that backend returns elements; adjust input image if none are detected.
+- Save edits, then GET the image by ID to confirm elements persisted.
+- Export PNG to ensure the canvas matches edits.
+
+You now have a clear picture of what each component does, why it was chosen, and how to run and extend the system. If you want, we can add Dockerfiles and a docker-compose.yml, CI workflows, and more advanced font detection as a follow-up.
